@@ -13,7 +13,7 @@
 /**  */
 import { equal } from "@wry/equality";
 import * as React from "react";
-import { asapScheduler, observeOn } from "rxjs";
+import { Subscription } from "rxjs";
 
 import type {
   DataState,
@@ -208,12 +208,18 @@ export declare namespace useQuery {
 }
 
 const lastWatchOptions = Symbol();
+const lastSubscription = Symbol();
 
 interface ObsQueryWithMeta<TData, TVariables extends OperationVariables>
   extends ObservableQuery<TData, TVariables> {
   [lastWatchOptions]?: Readonly<
     ApolloClient.WatchQueryOptions<TData, TVariables>
   >;
+  [lastSubscription]?: {
+    subscription: Subscription;
+    pauseChanges: () => void;
+    activateChanges: () => void;
+  };
 }
 
 interface InternalResult<TData> {
@@ -546,45 +552,42 @@ function useResult<TData, TVariables extends OperationVariables>(
   return useSyncExternalStore(
     React.useCallback(
       (handleStoreChange) => {
-        const subscription = observable
-          // We use the asapScheduler here to prevent issues with trying to
-          // update in the middle of a render. `reobserve` is kicked off in the
-          // middle of a render and because RxJS emits values synchronously,
-          // its possible for this `handleStoreChange` to be called in that same
-          // render. This allows the render to complete before trying to emit a
-          // new value.
-          .pipe(observeOn(asapScheduler))
-          .subscribe((result) => {
-            const previous = resultData.current;
+        let pauseChanges = false;
+        const subscription = observable.subscribe((result) => {
+          const previous = resultData.current;
 
-            if (
-              // Avoid rerendering if the result is the same
-              equal(previous, result) &&
-              // Force rerender if the value was emitted because variables
-              // changed, such as when calling `refetch(newVars)` which returns
-              // the same data when `notifyOnNetworkStatusChange` is `false`.
-              equal(resultData.variables, observable.variables)
-            ) {
-              return;
-            }
+          if (
+            // Avoid rerendering if the result is the same
+            equal(previous, result) &&
+            // Force rerender if the value was emitted because variables
+            // changed, such as when calling `refetch(newVars)` which returns
+            // the same data when `notifyOnNetworkStatusChange` is `false`.
+            equal(resultData.variables, observable.variables)
+          ) {
+            return;
+          }
 
-            // eslint-disable-next-line react-compiler/react-compiler
-            resultData.variables = observable.variables;
+          // eslint-disable-next-line react-compiler/react-compiler
+          resultData.variables = observable.variables;
 
-            if (previous.data && !equal(previous.data, result.data)) {
-              resultData.previousData = previous.data as TData;
-            }
+          if (previous.data && !equal(previous.data, result.data)) {
+            resultData.previousData = previous.data as TData;
+          }
 
-            resultData.current = result;
-            handleStoreChange();
-          });
+          resultData.current = result;
 
-        // Do the "unsubscribe" with a short delay.
-        // This way, an existing subscription can be reused without an additional
-        // request if "unsubscribe"  and "resubscribe" to the same ObservableQuery
-        // happen in very fast succession.
+          if (pauseChanges) return;
+
+          handleStoreChange();
+        });
+
+        observable[lastSubscription] = {
+          subscription,
+          pauseChanges: () => (pauseChanges = true),
+          activateChanges: () => (pauseChanges = false),
+        };
         return () => {
-          setTimeout(() => subscription.unsubscribe());
+          subscription.unsubscribe();
         };
       },
 
@@ -631,7 +634,10 @@ function useResubscribeIfNecessary<
     // (potentially) kicks off a network request (for example, when the
     // variables have changed), which is technically a side-effect.
     if (shouldReobserve(observable[lastWatchOptions], watchQueryOptions)) {
+      // The reobserve method will handle the cancellation internally
+      observable[lastSubscription]?.pauseChanges();
       observable.reobserve(watchQueryOptions);
+      observable[lastSubscription]?.activateChanges();
     } else {
       observable.applyOptions(watchQueryOptions);
     }
